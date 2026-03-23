@@ -8,7 +8,26 @@ The pipeline produces PLY point cloud files from 5-10 input images of a scene.
 
 ---
 
+## 0. Repository Structure
+
+GGPT depends on four bundled libraries (previously git submodules, now included as regular directories with CPU patches applied):
+
+| Directory | Purpose | CPU Patches Applied |
+|---|---|---|
+| `vggt/` | VGGT-1B feedforward model — monocular depth/point estimation & camera pose prediction | CPU-safe autocast context manager |
+| `RoMaV2/` | RoMa V2 dense feature matcher — pairwise image correspondence | Force CPU device, disable bfloat16 autocast, `nn.Buffer` compat, skip `torch.compile` |
+| `RoMa/` | RoMa V1 dense matcher (alternative to RoMaV2) | No patches needed (not used by default) |
+| `Pointcept/` | PointTransformerV3 backbone — point cloud processing for GGPT refinement | Safe imports for missing GPU-only deps |
+
+These directories contain the full source code with all CPU-compatibility patches already applied. No separate installation or cloning is needed for them.
+
+The `spconv_shim.py` file provides a CPU replacement for the `spconv` library (sparse 3D convolution), which has no macOS distribution. It is registered automatically by `install_spconv_shim.py` before any Pointcept imports in the CPU runner.
+
+---
+
 ## 1. Environment Setup
+
+All components (GGPT, vggt, RoMaV2, RoMa, Pointcept) share a **single conda environment**. No separate environments are needed.
 
 ### 1.1 Create Conda Environment
 
@@ -21,7 +40,7 @@ The pipeline produces PLY point cloud files from 5-10 input images of a scene.
 
 ```bash
 export PATH="/Users/yiliu/opt/anaconda3/envs/ggpt_cpu/bin:$PATH"
-cd /Users/yiliu/Documents/Repos/GGPT
+cd /path/to/GGPT
 
 # PyTorch CPU (2.2.2 is the latest for macOS x86_64)
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
@@ -30,34 +49,77 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 # opencv <4.13 required (4.13+ forces numpy 2.x)
 pip install "numpy<2" "opencv-python==4.10.0.84"
 
-# Core dependencies
+# Core GGPT + SfM dependencies
 pip install Pillow huggingface_hub einops safetensors
 pip install pycolmap==3.12.0
 pip install git+https://github.com/cvg/LightGlue.git
 pip install hydra-core h5py pyyaml scipy plyfile addict timm matplotlib
 
-# RoMaV2 (from local submodule, patched for CPU)
+# RoMaV2 matcher (installed from local patched source)
 cd RoMaV2 && pip install -e . && cd ..
 
-# torch-scatter (for GGPT refinement stage)
+# torch-scatter (required by Pointcept/PTv3 for GGPT refinement stage)
 pip install torch-scatter -f https://data.pyg.org/whl/torch-2.2.2+cpu.html
 ```
 
-### 1.3 Download GGPT Checkpoint (for refinement mode)
+**Note on vggt, Pointcept, and RoMa:** These are NOT pip-installed. They are loaded at runtime via `sys.path` by `run_demo_cpu.py`. Their dependencies (einops, timm, etc.) are already covered by the installs above.
+
+### 1.3 Download Model Weights
 
 ```bash
 export PATH="/Users/yiliu/opt/anaconda3/envs/ggpt_cpu/bin:$PATH"
+
+# GGPT refinement checkpoint (~214 MB, only needed with --ggpt_refine)
 mkdir -p ckpts
 python -c "
 from huggingface_hub import hf_hub_download
 hf_hub_download(repo_id='YutongGoose/GGPT', filename='model.step228000.pth', local_dir='ckpts/')
-print('Checkpoint downloaded.')
+print('GGPT checkpoint downloaded.')
 "
 ```
 
-The VGGT-1B model (~5GB) and RoMaV2 weights (~1GB) are downloaded automatically on first run.
+The following are downloaded **automatically on first run** (cached in `~/.cache/`):
+- **VGGT-1B** (~5 GB) — from HuggingFace `facebook/VGGT-1B`
+- **RoMaV2 weights** (~1 GB) — from GitHub releases
+- **DINOv3 backbone** (~1 GB) — via `torch.hub` (used by RoMaV2)
+- **SuperPoint** (~5 MB) — via `torch.hub` (used by LightGlue)
 
-### 1.4 Verify Installation
+### 1.4 DINOv3 Hub Cache Patch (one-time, automatic on first run)
+
+RoMaV2 uses DINOv3 as its feature backbone, loaded via `torch.hub`. The DINOv3 source code uses PyTorch 2.4+ APIs (`torch.amp.custom_fwd` with `device_type` kwarg). Since macOS x86_64 is limited to PyTorch 2.2.2, the cached file needs patching.
+
+**After the first `run_demo_cpu.py` run** (which triggers the DINOv3 download), apply this one-time patch:
+
+```bash
+# Find the cached DINOv3 file
+DINOV3_FILE=$(find ~/.cache/torch/hub -name "ms_deform_attn.py" -path "*/dinov3/*" 2>/dev/null)
+
+# Apply the patch (replaces the import and wraps decorators for PyTorch 2.2 compat)
+python -c "
+import re
+path = '$DINOV3_FILE'
+with open(path) as f: code = f.read()
+old = 'from torch.amp import custom_fwd, custom_bwd'
+new = '''from torch.cuda.amp import custom_fwd as _orig_custom_fwd, custom_bwd as _orig_custom_bwd
+
+# Compatibility shim: newer PyTorch uses device_type kwarg, older doesn't
+def custom_fwd(*args, **kwargs):
+    kwargs.pop(\"device_type\", None)
+    if args: return _orig_custom_fwd(*args, **kwargs)
+    if kwargs: return _orig_custom_fwd(**kwargs)
+    return _orig_custom_fwd
+
+def custom_bwd(*args, **kwargs):
+    kwargs.pop(\"device_type\", None)
+    if args: return _orig_custom_bwd(*args, **kwargs)
+    return _orig_custom_bwd'''
+code = code.replace(old, new)
+with open(path, 'w') as f: f.write(code)
+print(f'Patched: {path}')
+"
+```
+
+### 1.5 Verify Installation
 
 ```bash
 export PATH="/Users/yiliu/opt/anaconda3/envs/ggpt_cpu/bin:$PATH"
@@ -214,27 +276,53 @@ Tips for reducing time/memory:
 
 ## 6. Code Modifications Summary
 
-Files modified from original GGPT repo for CPU support:
+All patches below are already applied in this repository.
+
+### GGPT core files
 
 | File | Change |
 |---|---|
 | `run_demo.py` | Device auto-detection, CUDA guards, ggpt_refine conditional |
 | `run_demo_cpu.py` | **New** — standalone CPU runner bypassing Hydra |
-| `feedforward/__init__.py` | CPU-safe dtype selection and autocast |
+| `feedforward/__init__.py` | CPU-safe dtype selection and autocast for VGGT |
 | `sfm/sfm_func.py` | Guard `torch.cuda.empty_cache()` |
 | `utils/basic.py` | Guard CUDA seed/cudnn calls |
-| `vggt/vggt/models/vggt.py` | CPU-safe autocast context manager |
 | `configs/demo.yaml` | `ggpt_refine: False` default |
 | `ggpt/model/base.py` | Lazy imports for SpUNetBase/SPVCNN, dict access fix |
-| `spconv_shim.py` | **New** — CPU replacement for spconv (sparse conv) |
-| `install_spconv_shim.py` | **New** — registers shim in sys.modules |
-| `Pointcept/pointcept/models/__init__.py` | Safe imports for missing deps |
-| `RoMaV2/src/romav2/device.py` | Force CPU (skip MPS) |
-| `RoMaV2/src/romav2/features.py` | Disable bfloat16 autocast on CPU |
-| `RoMaV2/src/romav2/matcher.py` | `nn.Buffer` → `register_buffer`, disable autocast on CPU |
-| `RoMaV2/src/romav2/romav2.py` | Skip `torch.compile` on CPU |
-| `RoMaV2/pyproject.toml` | Remove `dataclasses` dep, relax `torchvision` version |
-| DINOv3 hub cache | Patch `custom_fwd`/`custom_bwd` for PyTorch 2.2 compat |
+| `spconv_shim.py` | **New** — CPU replacement for spconv (sparse 3D conv) |
+| `install_spconv_shim.py` | **New** — registers spconv shim in sys.modules |
+
+### vggt (feedforward model)
+
+| File | Change |
+|---|---|
+| `vggt/vggt/models/vggt.py` | Replace `torch.cuda.amp.autocast(enabled=False)` with conditional context manager using `contextlib.nullcontext()` when CUDA unavailable |
+
+### RoMaV2 (dense matcher)
+
+| File | Change |
+|---|---|
+| `RoMaV2/pyproject.toml` | Remove `dataclasses` dep (built into Python 3.7+), relax `torchvision>=0.17.0` for PyTorch 2.2 |
+| `RoMaV2/src/romav2/device.py` | Remove MPS fallback — force CPU (MPS lacks bfloat16 support) |
+| `RoMaV2/src/romav2/features.py` | Disable bfloat16 autocast and model conversion on CPU |
+| `RoMaV2/src/romav2/matcher.py` | Replace `nn.Buffer()` with `register_buffer()` (PyTorch <2.4 compat), disable autocast on CPU |
+| `RoMaV2/src/romav2/romav2.py` | Skip `torch.compile()` on CPU (dynamo not stable on PyTorch 2.2 macOS) |
+
+### RoMa (alternative matcher)
+
+No patches needed. RoMa V1 is included as-is but is not used by default (the pipeline uses RoMaV2). Can be selected with `--matcher roma`.
+
+### Pointcept (PTv3 backbone for GGPT refinement)
+
+| File | Change |
+|---|---|
+| `Pointcept/pointcept/models/__init__.py` | Wrap non-essential model imports in try/except so PTv3 loads without `torch_geometric`, `torchsparse`, and other GPU-only deps |
+
+### External cache (not in repo, needs one-time manual patch)
+
+| Location | Change |
+|---|---|
+| `~/.cache/torch/hub/facebookresearch_dinov3_*/dinov3/eval/segmentation/models/utils/ms_deform_attn.py` | Patch `custom_fwd`/`custom_bwd` decorators for PyTorch 2.2 compat (see Section 1.4) |
 
 ---
 

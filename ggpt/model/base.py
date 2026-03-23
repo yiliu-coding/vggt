@@ -12,8 +12,9 @@ import torch.distributed as dist
 import hydra
 from hydra.utils import instantiate
 import torchvision.transforms.v2 as v2
-from pointcept.models.sparse_unet.spconv_unet_v1m1_base import SpUNetBase
-from pointcept.models.spvcnn.ts_spvcnn import SPVCNN
+# Lazy imports - only loaded when the corresponding backbone_type is used
+# from pointcept.models.sparse_unet.spconv_unet_v1m1_base import SpUNetBase
+# from pointcept.models.spvcnn.ts_spvcnn import SPVCNN
 
 
 class BasePredictor(torch.nn.Module):
@@ -54,11 +55,13 @@ class BasePredictor(torch.nn.Module):
         self.backbone_type = backbone_type
         if backbone_type == 'ptv3':
             self.backbone = PointTransformerV3Model(in_channel,  **ptv3_config)
-            backbone_output_dim = ptv3_config.output_dim
+            backbone_output_dim = ptv3_config['output_dim'] if isinstance(ptv3_config, dict) else ptv3_config.output_dim
         elif backbone_type == 'spconv_unet':
+            from pointcept.models.sparse_unet.spconv_unet_v1m1_base import SpUNetBase
             self.backbone = SpUNetBase(in_channel, **spconv_config)
             backbone_output_dim = self.backbone.channels[-1]
         elif backbone_type == 'spvcnn':
+            from pointcept.models.spvcnn.ts_spvcnn import SPVCNN
             self.backbone = SPVCNN(in_channel, **spvcnn_config)
             backbone_output_dim = self.backbone.out_channels
         self.predict_residual = predict_residual

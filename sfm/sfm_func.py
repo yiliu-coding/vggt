@@ -37,7 +37,8 @@ def run_sfm(images, ff_outputs, match_models, cfg, gt=None, output_dir=None):
 
     if cfg.common_config.reduce_memory:
         del match_models
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
     M_ba = (match_results['pred_scores']>cfg.ba_config.score_thresh) & (match_results['pred_cycle_error']<cfg.ba_config.cycle_err_thresh)
     M_dlt = (match_results['pred_scores']>cfg.dlt_config.score_thresh) & (match_results['pred_cycle_error']<cfg.dlt_config.cycle_err_thresh)

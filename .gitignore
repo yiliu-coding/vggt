@@ -3,8 +3,10 @@ GGPT_eval/
 ckpts/
 feedforward/checkpoints
 examples/
+!examples/house/
 flast-attention/
 outputs/
+.DS_Store
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

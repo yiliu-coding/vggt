@@ -37,7 +37,7 @@ common_config:
   save_vis: True
   save_outputs: False
   ggpt_ckpt: ckpts/model.step228000.pth
-  ggpt_refine: True
+  ggpt_refine: False
   reduce_memory: False #delete intermediate results and models to free memory
   max_pts_num: 1000000 # maximum number of points to save as ply
   conf_quantile_thresh: 0.2 # quantile threshold for confidence score

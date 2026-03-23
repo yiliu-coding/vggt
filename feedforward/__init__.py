@@ -63,13 +63,16 @@ class FeedForward_Model(torch.nn.Module):
 
     def forward(self, images, preprocessed=False, gt_dict=None):
         output_dict = {}
-        device = images.device if isinstance(images, torch.Tensor) else 'cuda'
+        device = images.device if isinstance(images, torch.Tensor) else ('cuda' if torch.cuda.is_available() else 'cpu')
         output_width = 504 if self.configs.model == 'dav3' else 518
         images_ff = preprocess(images, output_width).to(device) if not preprocessed else images
         output_dict['images_ff'] = images_ff
         if 'vggt' in self.configs.model:
-            dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
-            with torch.autocast(device_type='cuda', dtype=dtype):
+            if torch.cuda.is_available():
+                dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+                with torch.autocast(device_type='cuda', dtype=dtype):
+                    raw_outputs = self.model(images_ff.permute(0,3,1,2))  #(N,3,H,W)
+            else:
                 raw_outputs = self.model(images_ff.permute(0,3,1,2))  #(N,3,H,W)
             from vggt.utils.pose_enc import pose_encoding_to_extri_intri
             output_dict['extrinsics'], output_dict['intrinsics'] = pose_encoding_to_extri_intri(raw_outputs['pose_enc'], images_ff.shape[1:3])

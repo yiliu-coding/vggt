@@ -57,7 +57,7 @@ def filter_points(points, confs=None, masks=None, max_pts_num=None, conf_quantil
 @hydra.main(version_base=None, config_path="configs",config_name="demo")
 def main(cfg):
     set_seed(cfg.common_config.seed)
-    device = 'cuda:0'
+    device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
     """
     Prepare Models (FeedForward and Matchers)
     """
@@ -93,7 +93,8 @@ def main(cfg):
 
     if cfg.common_config.reduce_memory:
         del ff_model
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     output_dir = hydra.core.hydra_config.HydraConfig.get().runtime.output_dir
 
@@ -111,52 +112,59 @@ def main(cfg):
         exit()
 
     if cfg.common_config.reduce_memory:
-        del match_models 
+        del match_models
     else:
-        del ff_model, match_models 
-    torch.cuda.empty_cache()
+        del ff_model, match_models
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
-    ggpt_model = instantiate(cfg.ggptmodel_config).eval()
-    ckpt = torch.load(cfg.common_config.ggpt_ckpt, map_location='cpu')
-    ckpt = {k.replace('module.',''):v for k,v in ckpt.items()}
-    ggpt_model.load_state_dict(ckpt, strict=True)
-    ggpt_model = ggpt_model.to(device)
-    print(f"Loaded GGPT model from {cfg.common_config.ggpt_ckpt}")
+    if cfg.common_config.ggpt_refine:
+        ggpt_model = instantiate(cfg.ggptmodel_config).eval()
+        ckpt = torch.load(cfg.common_config.ggpt_ckpt, map_location='cpu')
+        ckpt = {k.replace('module.',''):v for k,v in ckpt.items()}
+        ggpt_model.load_state_dict(ckpt, strict=True)
+        ggpt_model = ggpt_model.to(device)
+        print(f"Loaded GGPT model from {cfg.common_config.ggpt_ckpt}")
 
-    from ggpt.dataloader.demo_dataset import DemoDataset
-    from utils.points import aggregate_chunks
-    import time
-    
-    demo_dataset = DemoDataset(name='demo', ff_data=ff_outputs, geo_data=sfm_outputs)
-    scene_chunks, scene = demo_dataset[0]
-    chunks_batch = [[chunk] for chunk in scene_chunks] # Add the batch dimension (batch-size=1, each chunk is a single batch)
-    to_collect =  {'ff_pts':[], 'ff_pts_conf':[]}
-    t0 = time.time()
-    for chunk_batch in tqdm(chunks_batch, desc="GGPT inference"):
-        chunk_batch = move_to_device(chunk_batch, device)
-        with torch.no_grad():
-            out = ggpt_model(chunk_batch)
-        to_collect['ff_pts'].append(demo_dataset.unnormalize_pts(chunk_batch[0], out['ff_pts_out']))
-        to_collect['ff_pts_conf'].append(out['ff_pts_conf_out'])
-        
-    ff_pts_all = torch.cat(to_collect['ff_pts'], dim=0) # (num_chunks, num_view, H, W, 3)
-    ff_pts_conf_all = torch.cat(to_collect['ff_pts_conf'], dim=0) # (num_chunks, num_view, H, W)
-    msks_in_scene = torch.stack([chunk['msks_in_scene'] for chunk in scene_chunks], dim=0).to(device) # (num_chunks, num_view, H, W)
-    pred_pts, pred_confs, pred_mask = aggregate_chunks(ff_pts_all, ff_pts_conf_all, msks_in_scene, scene)
-    
-    t1 = time.time()
-    Print(f"GGPT inference done in {t1 - t0:.2f}s.")
+        from ggpt.dataloader.demo_dataset import DemoDataset
+        from utils.points import aggregate_chunks
+        import time
+
+        demo_dataset = DemoDataset(name='demo', ff_data=ff_outputs, geo_data=sfm_outputs)
+        scene_chunks, scene = demo_dataset[0]
+        chunks_batch = [[chunk] for chunk in scene_chunks] # Add the batch dimension (batch-size=1, each chunk is a single batch)
+        to_collect =  {'ff_pts':[], 'ff_pts_conf':[]}
+        t0 = time.time()
+        for chunk_batch in tqdm(chunks_batch, desc="GGPT inference"):
+            chunk_batch = move_to_device(chunk_batch, device)
+            with torch.no_grad():
+                out = ggpt_model(chunk_batch)
+            to_collect['ff_pts'].append(demo_dataset.unnormalize_pts(chunk_batch[0], out['ff_pts_out']))
+            to_collect['ff_pts_conf'].append(out['ff_pts_conf_out'])
+
+        ff_pts_all = torch.cat(to_collect['ff_pts'], dim=0) # (num_chunks, num_view, H, W, 3)
+        ff_pts_conf_all = torch.cat(to_collect['ff_pts_conf'], dim=0) # (num_chunks, num_view, H, W)
+        msks_in_scene = torch.stack([chunk['msks_in_scene'] for chunk in scene_chunks], dim=0).to(device) # (num_chunks, num_view, H, W)
+        pred_pts, pred_confs, pred_mask = aggregate_chunks(ff_pts_all, ff_pts_conf_all, msks_in_scene, scene)
+
+        t1 = time.time()
+        Print(f"GGPT inference done in {t1 - t0:.2f}s.")
 
     if cfg.common_config.save_vis:
         sfm_masks = filter_points(sfm_outputs['points'], None, sfm_outputs['point_masks'], cfg.common_config.max_pts_num, cfg.common_config.conf_quantile_thresh)
         save_xyzrgb_to_ply(points=sfm_outputs['points'][sfm_masks], rgb=ff_outputs['images_ff'][sfm_masks], filename=os.path.join(output_dir, 'sfm_dlt_points.ply'))
         Print(f"Saved SfM DLT points to {os.path.join(output_dir, 'sfm_dlt_points.ply')}")
 
-        pred_mask = filter_points(pred_pts, pred_confs, None, cfg.common_config.max_pts_num, cfg.common_config.conf_quantile_thresh)
-        save_xyzrgb_to_ply(points=ff_outputs['points'][pred_mask], rgb=ff_outputs['images_ff'][pred_mask], filename=os.path.join(output_dir, 'ff_points.ply'))
-        Print(f"Saved feedforward points to {os.path.join(output_dir, 'ff_points.ply')}")
-        save_xyzrgb_to_ply(points=pred_pts[pred_mask], rgb=scene['images'][pred_mask].to(device),filename=os.path.join(output_dir, 'ggpt_points.ply'))
-        Print(f"Saved predicted points to {os.path.join(output_dir, 'ggpt_points.ply')}")
+        if cfg.common_config.ggpt_refine:
+            pred_mask = filter_points(pred_pts, pred_confs, None, cfg.common_config.max_pts_num, cfg.common_config.conf_quantile_thresh)
+            save_xyzrgb_to_ply(points=ff_outputs['points'][pred_mask], rgb=ff_outputs['images_ff'][pred_mask], filename=os.path.join(output_dir, 'ff_points.ply'))
+            Print(f"Saved feedforward points to {os.path.join(output_dir, 'ff_points.ply')}")
+            save_xyzrgb_to_ply(points=pred_pts[pred_mask], rgb=scene['images'][pred_mask].to(device),filename=os.path.join(output_dir, 'ggpt_points.ply'))
+            Print(f"Saved predicted points to {os.path.join(output_dir, 'ggpt_points.ply')}")
+        else:
+            ff_masks = filter_points(ff_outputs['points'], ff_outputs['points_conf'], None, cfg.common_config.max_pts_num, cfg.common_config.conf_quantile_thresh)
+            save_xyzrgb_to_ply(points=ff_outputs['points'][ff_masks], rgb=ff_outputs['images_ff'][ff_masks], filename=os.path.join(output_dir, 'ff_points.ply'))
+            Print(f"Saved feedforward points to {os.path.join(output_dir, 'ff_points.ply')}")
     return
 
 
